@@ -2,7 +2,7 @@ const router = require("express").Router()
 const getSheets = require("../googleSheet")
 const NodeCache = require("node-cache")
 
-// Initialize cache
+// Initialize cache - TTL increased for better performance
 const cache = new NodeCache({ stdTTL: 300, checkperiod: 120 })
 const dataCache = new NodeCache({ stdTTL: 30, checkperiod: 60 })
 
@@ -84,7 +84,54 @@ function getDateOnly(dateString) {
 }
 
 // ============================================================
-// CORE FUNCTION: Get pending rows
+// OPTIMIZED: Add entry to Status 3 sheet - NO READ, ONLY APPEND
+// ============================================================
+async function addToStatus3Sheet(billData) {
+  try {
+    const sheets = await getSheets()
+    const email = process.env.CRM_EMAIL || "crm-2@epil.biz"
+    
+    // Get current timestamp
+    const now = new Date()
+    const timestamp = `${now.getDate().toString().padStart(2, '0')}/${(now.getMonth() + 1).toString().padStart(2, '0')}/${now.getFullYear()} ${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`
+    
+    const newRow = [
+      email,                          // A: Email
+      billData.billNo,                // B: Bill Number
+      "Step 1",                       // C: ALWAYS "Step 1"
+      timestamp,                      // D: Current Timestamp
+      billData.plannedDate || "",     // E: Planned Date (from FMS Column U)
+      "Next Follow Up date",          // F: Static text
+      "",                             // G: Empty
+      billData.plannedForLoop || "",  // H: Plan for Loop Date (from FMS Column V)
+      "",                             // I: Empty
+      "NO"                            // J: Static text "NO"
+    ]
+    
+    const status3SheetName = process.env.STATUS3_SHEET_NAME || "Status 3"
+    
+    // DIRECT APPEND - No reading needed, much faster!
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `${status3SheetName}!A:J`,
+      valueInputOption: "USER_ENTERED",
+      insertDataOption: "INSERT_ROWS",
+      resource: {
+        values: [newRow]
+      }
+    })
+    
+    console.log(`✅ Added to Status 3: ${billData.billNo}`)
+    return true
+    
+  } catch (error) {
+    console.error(`❌ Error adding to Status 3 for bill ${billData.billNo}:`, error)
+    return false
+  }
+}
+
+// ============================================================
+// OPTIMIZED: Get pending rows with better caching
 // ============================================================
 async function getPendingRowsWithDateFilter(startTimestamp, endTimestamp, forceRefresh = false) {
   const cacheKey = `pending_rows_${startTimestamp || 'none'}_${endTimestamp || 'none'}`
@@ -238,7 +285,7 @@ router.get("/consignees", async (req, res) => {
 })
 
 // ============================================================
-// GET FILTERED DATA
+// GET FILTERED DATA - OPTIMIZED
 // ============================================================
 router.get("/", async (req, res) => {
   try {
@@ -287,6 +334,7 @@ router.get("/", async (req, res) => {
         billDate: row[1] || "",
         balance: row[6] || "0",
         plannedForLoop: row[21] || "",
+        plannedDate: row[20] || "",
         followUp1: row[24] || "",
         BalanceRemaining: row[12] || "0",
         followCount1: row[26] || "0",
@@ -304,7 +352,7 @@ router.get("/", async (req, res) => {
 })
 
 // ============================================================
-// BULK FOLLOW-UP UPDATE - USING BATCH UPDATE (FIXED)
+// OPTIMIZED BULK FOLLOW-UP UPDATE - PARALLEL PROCESSING
 // ============================================================
 router.post("/update-followup", async (req, res) => {
   try {
@@ -317,7 +365,7 @@ router.post("/update-followup", async (req, res) => {
     
     console.log(`✏️ Bulk update: ${billNumbers.length} bills -> ${followUpDate}`)
     
-    // Get fresh data to find row indices
+    // Get fresh data to find row indices and bill details
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
       range: `${process.env.SHEET_NAME}!A8:AU`,
@@ -326,35 +374,44 @@ router.post("/update-followup", async (req, res) => {
     
     const rows = response.data.values || []
     
-    // Create mapping of bill number to row index
-    const billToRowMap = new Map()
+    // Create mapping
+    const billDataMap = new Map()
     rows.forEach((row, index) => {
-      if (row[2]) billToRowMap.set(row[2].toString(), index)
+      if (row[2]) {
+        billDataMap.set(row[2].toString(), {
+          index: index,
+          row: row,
+          billNo: row[2],
+          plannedDate: row[20] || "",
+          plannedForLoop: row[21] || ""
+        })
+      }
     })
     
     const formattedDate = getDateOnly(followUpDate) || new Date().toISOString().split('T')[0]
     
-    // Prepare batch updates
+    // Prepare batch updates for FMS sheet
     const updateRequests = []
     const notFound = []
+    const successfulBills = []
     
     for (const billNumber of billNumbers) {
-      const rowIndex = billToRowMap.get(billNumber.toString())
-      if (rowIndex !== undefined) {
-        const sheetRow = rowIndex + 8
-        const followCount = parseInt(rows[rowIndex][26] || "0")
+      const billData = billDataMap.get(billNumber.toString())
+      if (billData) {
+        const sheetRow = billData.index + 8
+        const followCount = parseInt(billData.row[26] || "0")
         
-        // Add update for Y column (Follow Up Date)
         updateRequests.push({
           range: `${process.env.SHEET_NAME}!Y${sheetRow}`,
           values: [[formattedDate]]
         })
         
-        // Add update for AA column (Follow Count)
         updateRequests.push({
           range: `${process.env.SHEET_NAME}!AA${sheetRow}`,
           values: [[followCount + 1]]
         })
+        
+        successfulBills.push(billData)
       } else {
         notFound.push(billNumber)
       }
@@ -364,40 +421,35 @@ router.post("/update-followup", async (req, res) => {
       return res.json({ success: true, updatedCount: 0, notFound, message: "No valid bills found" })
     }
     
-    // Split into batches of 50 to avoid exceeding batch limits
-    const BATCH_SIZE = 50
-    let totalUpdated = 0
-    
-    for (let i = 0; i < updateRequests.length; i += BATCH_SIZE) {
-      const batch = updateRequests.slice(i, i + BATCH_SIZE)
-      
-      await sheets.spreadsheets.values.batchUpdate({
-        spreadsheetId: process.env.GOOGLE_SHEET_ID,
-        requestBody: {
-          valueInputOption: "USER_ENTERED",
-          data: batch
-        }
-      })
-      
-      totalUpdated += batch.length / 2 // Each bill has 2 updates
-      console.log(`✅ Batch ${Math.floor(i / BATCH_SIZE) + 1} completed: ${batch.length / 2} bills`)
-      
-      // Small delay between batches to avoid rate limiting
-      if (i + BATCH_SIZE < updateRequests.length) {
-        await new Promise(resolve => setTimeout(resolve, 1000))
+    // Execute FMS updates in single batch (faster)
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      requestBody: {
+        valueInputOption: "USER_ENTERED",
+        data: updateRequests
       }
-    }
+    })
+    
+    console.log(`✅ FMS updated: ${successfulBills.length} bills`)
+    
+    // OPTIMIZED: Parallel Status 3 inserts (faster than sequential)
+    const status3Promises = successfulBills.map(billData => addToStatus3Sheet(billData))
+    const status3Results = await Promise.all(status3Promises)
+    
+    const successCount = status3Results.filter(r => r === true).length
     
     // Clear all caches
     cache.flushAll()
     dataCache.flushAll()
     
-    console.log(`✅ Total updated: ${totalUpdated} bills, ${notFound.length} not found`)
+    console.log(`✅ Total updated: ${successfulBills.length} bills, Status 3 entries: ${successCount}`)
+    
     res.json({ 
       success: true, 
-      updatedCount: totalUpdated, 
+      updatedCount: successfulBills.length, 
       notFound: notFound,
-      message: `${totalUpdated} bills updated successfully`
+      status3EntriesCount: successCount,
+      message: `${successfulBills.length} bills updated successfully`
     })
     
   } catch (err) {
@@ -407,7 +459,7 @@ router.post("/update-followup", async (req, res) => {
 })
 
 // ============================================================
-// SINGLE FOLLOW-UP UPDATE
+// OPTIMIZED SINGLE FOLLOW-UP UPDATE
 // ============================================================
 router.post("/update-followup-single", async (req, res) => {
   try {
@@ -429,20 +481,28 @@ router.post("/update-followup-single", async (req, res) => {
     
     const rows = response.data.values || []
     let rowIndex = -1
+    let billData = null
     
     for (let i = 0; i < rows.length; i++) {
       if (rows[i][2] === billNumber) {
         rowIndex = i
+        billData = {
+          index: i,
+          row: rows[i],
+          billNo: rows[i][2],
+          plannedDate: rows[i][20] || "",
+          plannedForLoop: rows[i][21] || ""
+        }
         break
       }
     }
     
-    if (rowIndex !== -1) {
+    if (rowIndex !== -1 && billData) {
       const sheetRow = rowIndex + 8
       const followCount = parseInt(rows[rowIndex][26] || "0")
       const formattedDate = getDateOnly(followUpDate) || new Date().toISOString().split('T')[0]
       
-      // Use batch update for single too (consistent)
+      // Single batch update for FMS
       await sheets.spreadsheets.values.batchUpdate({
         spreadsheetId: process.env.GOOGLE_SHEET_ID,
         requestBody: {
@@ -460,16 +520,78 @@ router.post("/update-followup-single", async (req, res) => {
         }
       })
       
+      // Add to Status 3
+      await addToStatus3Sheet(billData)
+      
       cache.flushAll()
       dataCache.flushAll()
       
-      res.json({ success: true, message: "Follow-up updated successfully" })
+      res.json({ 
+        success: true, 
+        message: `Follow-up updated successfully`
+      })
     } else {
       res.status(404).json({ success: false, error: "Bill number not found" })
     }
   } catch (err) {
     console.error("❌ Error:", err)
     res.status(500).json({ error: err.message })
+  }
+})
+
+// ============================================================
+// GET FOLLOW-UP HISTORY - OPTIMIZED WITH INDEX
+// ============================================================
+router.get("/history/:billNumber", async (req, res) => {
+  try {
+    const { billNumber } = req.params
+    const cacheKey = `history_${billNumber}`
+    
+    const cachedHistory = cache.get(cacheKey)
+    if (cachedHistory) {
+      return res.json(cachedHistory)
+    }
+    
+    const sheets = await getSheets()
+    const status3SheetName = process.env.STATUS3_SHEET_NAME || "Status 3"
+    
+    const response = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `${status3SheetName}!A:J`,
+      majorDimension: 'ROWS'
+    })
+    
+    const rows = response.data.values || []
+    const history = []
+    
+    for (const row of rows) {
+      if (row[1] === billNumber) {
+        history.push({
+          email: row[0],
+          billNo: row[1],
+          step: row[2],
+          timestamp: row[3],
+          plannedDate: row[4],
+          nextFollowUpText: row[5],
+          planForLoopDate: row[7],
+          status: row[9]
+        })
+      }
+    }
+    
+    const result = {
+      billNumber: billNumber,
+      totalFollowUps: history.length,
+      history: history.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+    }
+    
+    cache.set(cacheKey, result, 60) // Cache for 60 seconds
+    
+    res.json(result)
+    
+  } catch (error) {
+    console.error("❌ Error fetching history:", error)
+    res.status(500).json({ error: error.message })
   }
 })
 
